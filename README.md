@@ -1,0 +1,2 @@
+# GTNH-Petrochemical-Production-Chain
+一个用于计算GTNH中油的各种线路的工具。你只需要核对整理数据然后允许python脚本就可以生成原始数据。
