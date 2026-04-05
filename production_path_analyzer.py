@@ -18,9 +18,10 @@ def read_distillation_data(file_path):
 def parse_distillation_data(distillation_df):
     """
     解析石油蒸馏数据
-    返回: {原油类型: {产物类型: 产量}}
+    返回: {原油类型: {产物类型: 产量}}, product_types, crude_oil_types, {原油类型: 需要时间}
     """
     data = {}
+    time_data = {}
 
     # 提取表头
     product_types = distillation_df.iloc[0, 1:6].tolist()  # B1-F1
@@ -30,13 +31,14 @@ def parse_distillation_data(distillation_df):
     for i in range(1, 5):  # 行索引1-4对应A2-A5
         crude_oil = distillation_df.iloc[i, 0]
         data[crude_oil] = {}
+        time_data[crude_oil] = distillation_df.iloc[i, 6]  # 列6 = 需要时间
 
         for j in range(1, 6):  # 列索引1-4对应B2-E5
             product = product_types[j - 1]
             quantity = distillation_df.iloc[i, j]
             data[crude_oil][product] = quantity if pd.notna(quantity) else 0
 
-    return data, product_types, crude_oil_types
+    return data, product_types, crude_oil_types, time_data
 
 def parse_cracking_data(cracking_df):
     """
@@ -154,6 +156,7 @@ def calculate_final_products_optimized(distillation_data, cracking_data, post_cr
     优化的多线程版本，支持批量处理
     """
     results = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    intermediate_results = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
 
     processing_procedures = get_all_processing_procedures(product_types, cracking_methods, cracking_data)
 
@@ -193,11 +196,13 @@ def calculate_final_products_optimized(distillation_data, cracking_data, post_cr
             )
 
             # 合并结果
-            for crude, procedure, final_products in batch_results:
+            for crude, procedure, final_products, intermediate in batch_results:
                 for product, qty in final_products.items():
                     results[crude][str(procedure)][product] = qty
+                for product, qty in intermediate.items():
+                    intermediate_results[crude][str(procedure)][product] = qty
 
-    return results
+    return results, intermediate_results
 
 def process_batch_multi_thread(tasks, max_workers, batch_name):
     """处理一个批次的任务"""
@@ -230,11 +235,15 @@ def process_batch_multi_thread(tasks, max_workers, batch_name):
 def process_single_procedure_with_idx(args):
     """
     处理单个裂解组合的函数（用于多线程）
+    返回: (原油类型, 裂解方式, 最终产物, 中间产物处理量)
     """
     crude_oil, products, processing_procedure, cracking_data, post_cracking_data, idx = args
 
     # 初始化最终产物字典
     final_products = defaultdict(float)
+
+    # 记录每种中间产物的总处理量（需要进入裂解的量）
+    intermediate_throughput = defaultdict(float)
 
     # 需要递归处理的中间产物队列
     # 格式: [(产物类型, 初始数量, 裂解方式)]
@@ -265,6 +274,9 @@ def process_single_procedure_with_idx(args):
         if current_qty <= maximum_acceptable_error_value:
             continue
 
+        # 记录中间产物处理量
+        intermediate_throughput[current_product] += current_qty
+
         # 获取当前产物在选定裂解方式下的裂解产量
         cracking_yield = cracking_data[current_product].get(current_method, 0)
 
@@ -288,7 +300,7 @@ def process_single_procedure_with_idx(args):
                         final_products[output_product] += output_qty
         processed_count += 1
 
-    return crude_oil, processing_procedure, final_products
+    return crude_oil, processing_procedure, final_products, intermediate_throughput
 
 # def calculate_final_products(distillation_data, cracking_data, post_cracking_data,
 #                              product_types, cracking_methods):
@@ -371,37 +383,111 @@ def process_single_procedure_with_idx(args):
 #     return results
 
 
-def save_results_to_excel(results, output_file):
+def _add_group_header(ws, group_ranges):
+    """
+    在第1行添加合并单元格的分组表头
+    group_ranges: [(分组名, 起始列号, 结束列号), ...]  列号从1开始
+    """
+    from openpyxl.styles import Alignment
+    for name, start_col, end_col in group_ranges:
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+        cell = ws.cell(row=1, column=start_col, value=name)
+        cell.alignment = Alignment(horizontal='center')
+
+
+def save_results_to_excel(results, intermediate_results, time_data, output_file):
     """
     将结果保存到Excel文件
+    - 裂解方式拆分为多列（重燃油、轻燃油、石脑油、炼油气、乙烷、丙烷）
+    - 每秒产出表中合并中间产物处理量
+    - 上方增加合并单元格的分组表头行
     """
+    import ast
+
+    procedure_col_names = ['重燃油', '轻燃油', '石脑油', '炼油气', '乙烷', '丙烷']
+
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        # 准备数据用于DataFrame
-        all_data = []
-
+        # ===== Sheet 1: 每1000L产出 =====
+        rows = []
         for crude_oil, methods in results.items():
-            for method, products in methods.items():
-                row = {'原油类型': crude_oil, '裂解方式': method}
+            for method_str, products in methods.items():
+                procedure = ast.literal_eval(method_str)
+                row = {'原油类型': crude_oil}
+                for col in procedure_col_names:
+                    row[col] = procedure.get(col, '')
                 for product, qty in products.items():
-                    if qty > 0:  # 只保存产量大于0的产物
+                    if qty > 0:
                         row[product] = qty
-                all_data.append(row)
+                rows.append(row)
 
-        # 创建DataFrame并保存
-        if all_data:
-            df = pd.DataFrame(all_data)
+        if rows:
+            df = pd.DataFrame(rows)
+            meta_cols = ['原油类型']
+            product_cols = sorted([c for c in df.columns
+                                   if c not in meta_cols + procedure_col_names])
+            df = df[meta_cols + procedure_col_names + product_cols]
 
-            # 重新排序列，让原油类型和裂解方式在前
-            columns = ['原油类型', '裂解方式']
-            other_cols = [col for col in df.columns if col not in columns]
-            df = df[columns + sorted(other_cols)]
+            # startrow=1 留出第1行给分组表头
+            df.to_excel(writer, sheet_name='每1000L产出', index=False, startrow=1)
+            ws = writer.sheets['每1000L产出']
 
-            df.to_excel(writer, sheet_name='计算结果', index=False)
+            # 裂解方式分组表头：列从 meta_cols 之后开始
+            proc_start = len(meta_cols) + 1
+            proc_end = proc_start + len(procedure_col_names) - 1
+            _add_group_header(ws, [('裂解方式', proc_start, proc_end)])
 
-            print(f"\n结果已保存到: {output_file}")
-            print(f"总计 {len(df)} 条记录")
-        else:
-            print("警告: 没有计算结果可保存")
+            print(f"每1000L产出: {len(df)} 条记录")
+
+        # ===== Sheet 2: 每秒产出 + 中间产物处理量 =====
+        rows = []
+        for crude_oil, methods in results.items():
+            t = time_data[crude_oil]
+            for method_str, products in methods.items():
+                procedure = ast.literal_eval(method_str)
+                row = {'原油类型': crude_oil, '蒸馏时间(s)': t}
+                for col in procedure_col_names:
+                    row[col] = procedure.get(col, '')
+                for product, qty in products.items():
+                    if qty > 0:
+                        row[product] = qty / t
+                # 中间产物处理量，加前缀避免与裂解方式列重名
+                for product, qty in intermediate_results[crude_oil][method_str].items():
+                    if qty > 0:
+                        row['中间_' + product] = qty / t
+                rows.append(row)
+
+        if rows:
+            df = pd.DataFrame(rows)
+            meta_cols = ['原油类型', '蒸馏时间(s)']
+            product_cols = sorted([c for c in df.columns
+                                   if c not in meta_cols + procedure_col_names
+                                   and not c.startswith('中间_')])
+            inter_cols = sorted([c for c in df.columns if c.startswith('中间_')])
+
+            df = df[meta_cols + procedure_col_names + product_cols + inter_cols]
+
+            # 写入数据前，将中间产物列名的前缀去掉（只在表头显示原名）
+            rename_map = {c: c.replace('中间_', '') for c in inter_cols}
+            df = df.rename(columns=rename_map)
+
+            df.to_excel(writer, sheet_name='每秒产出', index=False, startrow=1)
+            ws = writer.sheets['每秒产出']
+
+            # 裂解方式分组表头
+            proc_start = len(meta_cols) + 1
+            proc_end = proc_start + len(procedure_col_names) - 1
+            # 中间产物处理量分组表头
+            inter_start = len(meta_cols) + len(procedure_col_names) + len(product_cols) + 1
+            inter_end = inter_start + len(inter_cols) - 1
+
+            groups = [('裂解方式', proc_start, proc_end)]
+            if inter_cols:
+                groups.append(('每秒中间产物处理量', inter_start, inter_end))
+            _add_group_header(ws, groups)
+
+            print(f"每秒产出: {len(df)} 条记录")
+
+        print(f"\n结果已保存到: {output_file}")
 
 
 def main():
@@ -416,7 +502,7 @@ def main():
 
         # 2. 解析数据
         print("正在解析石油蒸馏数据...")
-        distillation_data, product_types, crude_oil_types = parse_distillation_data(distillation_df)
+        distillation_data, product_types, crude_oil_types, time_data = parse_distillation_data(distillation_df)
 
         print("正在解析裂解数据...")
         cracking_data, cracking_methods, feedstocks = parse_cracking_data(cracking_df)
@@ -435,7 +521,7 @@ def main():
 
         # 3. 计算最终产物
         print("\n正在计算最终产物...")
-        results = calculate_final_products_optimized(
+        results, intermediate_results = calculate_final_products_optimized(
             distillation_data,
             cracking_data,
             post_cracking_data,
@@ -445,7 +531,7 @@ def main():
 
         # 4. 保存结果
         print("\n正在保存结果...")
-        save_results_to_excel(results, output_file)
+        save_results_to_excel(results, intermediate_results, time_data, output_file)
 
         # 5. 显示部分结果
         print("\n部分计算结果示例:")
